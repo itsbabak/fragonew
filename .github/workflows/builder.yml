@@ -1,3 +1,4 @@
+
 name: Build Frago ARM64 APK
 
 on:
@@ -11,70 +12,154 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+
     steps:
-      - name: Checkout SocksDroid source
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java 11
+      - name: Find and extract Frago ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="$GITHUB_WORKSPACE/Frago-ARM64-source.zip"
+
+          if [ ! -f "$ZIP_FILE" ]; then
+            ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 \
+              -type f -iname '*.zip' -print -quit)"
+          fi
+
+          if [ -z "${ZIP_FILE:-}" ] || [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: No source ZIP found!"
+            exit 1
+          fi
+
+          echo "Found source: $ZIP_FILE"
+
+          mkdir -p "$GITHUB_WORKSPACE/frago-extracted"
+
+          unzip -oq "$ZIP_FILE" \
+            -d "$GITHUB_WORKSPACE/frago-extracted"
+
+          PROJECT_DIR="$(dirname "$(find \
+            "$GITHUB_WORKSPACE/frago-extracted" \
+            -type f -name gradlew -print -quit)")"
+
+          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/gradlew" ]; then
+            echo "ERROR: gradlew not found inside ZIP!"
+            find "$GITHUB_WORKSPACE/frago-extracted" \
+              -maxdepth 3 -type f | head -100
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Frago source extracted successfully:"
+          echo "$PROJECT_DIR"
+
+          ls -la "$PROJECT_DIR"
+
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '11'
 
-      - name: Set up Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+          accept-android-sdk-licenses: true
 
-      - name: Install Android build tools
+      - name: Install Android build packages
         run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platforms;android-31" "build-tools;31.0.0" "platform-tools"
+          set -euo pipefail
 
-      - name: Download official Xray Android ARM64 core
+          sdkmanager --install \
+            "platforms;android-31" \
+            "build-tools;31.0.0" \
+            "platform-tools"
+
+      - name: Download and prepare Xray ARM64
         shell: bash
         run: |
           set -euo pipefail
+
           XRAY_VERSION="v26.11.9"
           XRAY_SHA256="edcefc25b9b3195b11e18624c8269a969d6aabc39c6298a9a5ab29de15d46f3b"
-          ARCHIVE="$RUNNER_TEMP/xray-android-arm64.zip"
+
+          ARCHIVE="$RUNNER_TEMP/xray-arm64.zip"
+
           curl -fL --retry 3 \
             "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-android-arm64-v8a.zip" \
             -o "$ARCHIVE"
+
           echo "${XRAY_SHA256}  ${ARCHIVE}" | sha256sum --check -
-          mkdir -p "$RUNNER_TEMP/xray-core"
-          unzip -q "$ARCHIVE" -d "$RUNNER_TEMP/xray-core"
-          XRAY_BIN="$(find "$RUNNER_TEMP/xray-core" -type f -name xray -print -quit)"
+
+          mkdir -p "$RUNNER_TEMP/xray"
+
+          unzip -oq "$ARCHIVE" -d "$RUNNER_TEMP/xray"
+
+          XRAY_BIN="$(find "$RUNNER_TEMP/xray" \
+            -type f -name xray -print -quit)"
+
           test -n "$XRAY_BIN"
-          echo "Xray size before debug-section stripping: $(stat -c '%s' "$XRAY_BIN") bytes"
-          # The upstream checksum is verified above. Remove only ELF debug sections;
-          # Go runtime metadata and executable code remain intact.
+
           strip --strip-debug "$XRAY_BIN"
-          echo "Xray size after debug-section stripping:  $(stat -c '%s' "$XRAY_BIN") bytes"
-          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/assets/xray
-          install -m 755 "$XRAY_BIN" app/src/main/jniLibs/arm64-v8a/libxray.so
+
+          mkdir -p "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$PROJECT_DIR/app/src/main/assets/xray"
+
+          install -m 755 "$XRAY_BIN" \
+            "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libxray.so"
+
           curl -fL \
             "https://raw.githubusercontent.com/XTLS/Xray-core/${XRAY_VERSION}/LICENSE" \
-            -o app/src/main/assets/xray/LICENSE
-          test -x app/src/main/jniLibs/arm64-v8a/libxray.so
-          readelf -h app/src/main/jniLibs/arm64-v8a/libxray.so | grep -Eq 'Machine:.*AArch64'
-          file app/src/main/jniLibs/arm64-v8a/libxray.so
+            -o "$PROJECT_DIR/app/src/main/assets/xray/LICENSE"
 
-      - name: Build debug and optimized Frago APKs
+          readelf -h \
+            "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/libxray.so" \
+            | grep -Eq 'Machine:.*AArch64'
+
+          echo "Xray ARM64 installed successfully."
+
+      - name: Build Frago APKs
+        shell: bash
         run: |
-          chmod +x ./gradlew
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          chmod +x gradlew
+
           ./gradlew --no-daemon clean assembleDebug assembleRelease
 
-      - name: Upload debug APK
+      - name: Verify APK outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+
+          test -f "$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
+
+          echo "Frago APKs successfully built."
+
+          ls -lh "$PROJECT_DIR/app/build/outputs/apk/debug/"
+          ls -lh "$PROJECT_DIR/app/build/outputs/apk/release/"
+
+      - name: Upload Frago Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: Frago-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: frago-extracted/**/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload optimized Lite APK
+      - name: Upload Frago Optimized APK
         uses: actions/upload-artifact@v4
         with:
           name: Frago-optimized
-          path: app/build/outputs/apk/release/app-release.apk
+          path: frago-extracted/**/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 14
